@@ -7,6 +7,8 @@ import datetime as dt
 import hashlib
 import html
 import json
+import multiprocessing as mp
+import re
 import socket
 import time
 import urllib.error
@@ -16,8 +18,10 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
-USER_AGENT = "alicedingwow 13F report updater (https://github.com/alicedingwow/13f-report-2026-05-12)"
+USER_AGENT = "13f-report-2026-05-12 alicedingwow@example.com"
 CACHE_DIR = Path(".sec-cache")
+COMPANY_CACHE_DIR = Path(".company-cache")
+COMPANY_PROFILE_CACHE = COMPANY_CACHE_DIR / "profiles.json"
 
 MANAGERS = [
     ("Appaloosa Management", "0001656456", "appaloosa-management"),
@@ -32,6 +36,118 @@ MANAGERS = [
     ("Tiger Global Management", "0001167483", "tiger-global-management"),
     ("Two Sigma Investments", "0001179392", "two-sigma-investments"),
 ]
+
+NAME_EXPANSIONS = {
+    "ADR": "ADR",
+    "AG": "AG",
+    "AIRLS": "AIRLINES",
+    "AMERN": "AMERICAN",
+    "BK": "BANK",
+    "BANCSHARES": "BANCSHARES",
+    "CDA": "CANADA",
+    "CL": "CLASS",
+    "CMNTYS": "COMMUNITIES",
+    "CO": "COMPANY",
+    "COM": "COMMON",
+    "COS": "COMPANIES",
+    "CORP": "CORPORATION",
+    "DEL": "",
+    "ELEC": "ELECTRIC",
+    "ENTMT": "ENTERTAINMENT",
+    "FD": "FUND",
+    "FINL": "FINANCIAL",
+    "HLDG": "HOLDING",
+    "HLDGS": "HOLDINGS",
+    "INDS": "INDUSTRIES",
+    "INTL": "INTERNATIONAL",
+    "INVT": "INVESTMENT",
+    "LTD": "LIMITED",
+    "MASS": "",
+    "MATLS": "MATERIALS",
+    "MLS": "MILLS",
+    "MNG": "MINING",
+    "MTR": "MOTOR",
+    "MTRS": "MOTORS",
+    "NATL": "NATIONAL",
+    "ONT": "",
+    "PARE": "PARENT",
+    "PETE": "PETROLEUM",
+    "PMTS": "PAYMENTS",
+    "PPTY": "PROPERTY",
+    "PWR": "POWER",
+    "RLTY": "REALTY",
+    "RUBR": "RUBBER",
+    "SHS": "SHARES",
+    "STL": "STEEL",
+    "SVCS": "SERVICES",
+    "SV": "SERVICES",
+    "SWITZ": "",
+    "TECH": "TECHNOLOGY",
+    "TR": "TRUST",
+    "WKS": "WORKS",
+}
+
+FUND_ISSUER_HINTS = (
+    "EXCHANGE TRADED",
+    "ISHARES",
+    "SPDR",
+    "VANECK",
+    "INVESCO",
+    "DIMENSIONAL ETF",
+    "FIRST TR",
+    "AMPLIFY ETF",
+    "PROSHARES",
+    "WISDOMTREE",
+)
+
+MANUAL_PROFILES = {
+    "00123Q104": "Real Estate / REIT - Mortgage",
+    "00215W100": "Technology / Semiconductors",
+    "05370A108": "Healthcare / Biotechnology",
+    "060505682": "Financial Services / Banks - Diversified",
+    "07782B104": "Healthcare / Biotechnology",
+    "12503M108": "Financial Services / Financial Data & Stock Exchanges",
+    "16119P108": "Communication Services / Telecom Services",
+    "171757206": "Healthcare / Biotechnology",
+    "20717M103": "Technology / Software - Infrastructure",
+    "254687106": "Communication Services / Entertainment",
+    "29445S100": "Industrials / Rental & Leasing Services",
+    "30063P105": "Healthcare / Diagnostics & Research",
+    "31946M103": "Financial Services / Banks - Regional",
+    "35909D109": "Communication Services / Telecom Services",
+    "413216300": "Basic Materials / Gold",
+    "436440101": "Healthcare / Medical Instruments & Supplies",
+    "59522J103": "Real Estate / REIT - Residential",
+    "644535106": "Basic Materials / Gold",
+    "650111107": "Communication Services / Publishing",
+    "697900108": "Basic Materials / Silver",
+    "758849103": "Real Estate / REIT - Retail",
+    "832696405": "Consumer Defensive / Packaged Foods",
+    "882508104": "Technology / Semiconductors",
+    "912008109": "Consumer Defensive / Food Distribution",
+    "G4766E116": "Healthcare / Drug Manufacturers - Specialty & Generic",
+    "G7997R103": "Technology / Computer Hardware",
+    "M2682V108": "Technology / Software - Infrastructure",
+    "M7S64H106": "Technology / Software - Application",
+}
+
+COMPANY_TOKEN_DROP = {
+    "ADR",
+    "AG",
+    "CLASS",
+    "COMMON",
+    "COMPANY",
+    "CORP",
+    "CORPORATION",
+    "INC",
+    "INCORPORATED",
+    "LIMITED",
+    "LTD",
+    "NEW",
+    "PLC",
+    "SHARES",
+    "THE",
+}
 
 
 @dataclass
@@ -56,12 +172,12 @@ class Holding:
         return (self.cusip, self.title, self.put_call)
 
 
-def fetch_text(url: str) -> str:
-    CACHE_DIR.mkdir(exist_ok=True)
-    cache_path = CACHE_DIR / hashlib.sha256(url.encode("utf-8")).hexdigest()
+def fetch_cached_text(url: str, cache_dir: Path, user_agent: str, pause: float) -> str:
+    cache_dir.mkdir(exist_ok=True)
+    cache_path = cache_dir / hashlib.sha256(url.encode("utf-8")).hexdigest()
     if cache_path.exists():
         return cache_path.read_text(encoding="utf-8")
-    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    req = urllib.request.Request(url, headers={"User-Agent": user_agent})
     last_error: Exception | None = None
     for attempt in range(4):
         try:
@@ -69,12 +185,16 @@ def fetch_text(url: str) -> str:
                 data = response.read()
             text = data.decode("utf-8", errors="replace")
             cache_path.write_text(text, encoding="utf-8")
-            time.sleep(0.2)
+            time.sleep(pause)
             return text
         except (OSError, socket.timeout, urllib.error.URLError) as exc:
             last_error = exc
             time.sleep(2 + attempt * 2)
     raise RuntimeError(f"Failed to fetch {url}: {last_error}")
+
+
+def fetch_text(url: str) -> str:
+    return fetch_cached_text(url, CACHE_DIR, USER_AGENT, 0.2)
 
 
 def sec_json(url: str) -> dict:
@@ -205,22 +325,212 @@ def e(value: str) -> str:
     return html.escape(value, quote=True)
 
 
-def security_cell(holding: Holding) -> str:
+def industry_fallback(holding: Holding) -> str:
+    issuer = holding.issuer.upper()
+    title = holding.title.upper()
+    combined = f"{issuer} {title}"
+    is_etf = re.search(r"\bETF\b", combined) is not None
+    is_fund_family = any(hint in combined for hint in FUND_ISSUER_HINTS)
+    if is_etf or is_fund_family:
+        return "ETF / fund"
+    if "NOTE" in title:
+        return "Convertible or corporate note"
+    if holding.put_call:
+        return f"{holding.put_call} option on underlying security"
+    return ""
+
+
+def clean_issuer_query(issuer: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9&. ]+", " ", issuer.upper())
+    tokens = []
+    for token in cleaned.split():
+        replacement = NAME_EXPANSIONS.get(token, token)
+        if replacement:
+            tokens.extend(replacement.split())
+    cleaned = " ".join(tokens)
+    cleaned = re.sub(r"\b(FORMERLY|NEW|OLD)\b.*$", "", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned.title()
+
+
+def normalized_company_name(name: str) -> str:
+    return re.sub(r"\s+", " ", clean_issuer_query(name).upper()).strip()
+
+
+def company_tokens(name: str) -> set[str]:
+    tokens = {
+        token
+        for token in re.sub(r"[^A-Z0-9 ]+", " ", normalized_company_name(name)).split()
+        if len(token) > 1
+    }
+    return tokens - COMPANY_TOKEN_DROP
+
+
+def yfinance_quote_score(quote: dict, query: str) -> int:
+    quote_type = quote.get("quoteType") or ""
+    if quote_type not in {"EQUITY", "ETF", "MUTUALFUND"}:
+        return -100
+    score = 0
+    if quote.get("sector") or quote.get("industry"):
+        score += 50
+    symbol = quote.get("symbol") or ""
+    if symbol and "." not in symbol:
+        score += 12
+    name = " ".join(
+        str(quote.get(key) or "")
+        for key in ("shortname", "longname", "displayName")
+    ).upper()
+    query_tokens = company_tokens(query)
+    name_tokens = company_tokens(name)
+    score += len(query_tokens & name_tokens) * 8
+    return score
+
+
+def clean_profile_label(label: str) -> str:
+    return (
+        label.replace("\u2014", " - ")
+        .replace("\u2013", "-")
+        .replace("  ", " ")
+        .strip()
+    )
+
+
+def profile_for_holding(holding: Holding) -> str:
+    fallback = industry_fallback(holding)
+    if fallback == "ETF / fund":
+        return fallback
+    if holding.cusip in MANUAL_PROFILES:
+        return MANUAL_PROFILES[holding.cusip]
+    try:
+        import yfinance as yf
+    except ImportError:
+        return fallback or "Industry unavailable"
+
+    queries = []
+    for query in (holding.issuer, clean_issuer_query(holding.issuer)):
+        query = query.strip()
+        if query and query not in queries:
+            queries.append(query)
+
+    best_quote = None
+    best_score = -100
+    for query in queries:
+        try:
+            search = yf.Search(query, max_results=6)
+        except Exception:
+            continue
+        for quote in search.quotes:
+            score = yfinance_quote_score(quote, query)
+            if score > best_score:
+                best_score = score
+                best_quote = quote
+
+    if best_quote:
+        quote_type = best_quote.get("quoteType") or ""
+        sector = best_quote.get("sector") or ""
+        industry = best_quote.get("industry") or ""
+        if sector and industry:
+            return clean_profile_label(f"{sector} / {industry}")
+        if industry:
+            return clean_profile_label(industry)
+        if sector:
+            return clean_profile_label(sector)
+        if quote_type in {"ETF", "MUTUALFUND"}:
+            return "ETF / fund"
+    return fallback or "Industry unavailable"
+
+
+def profile_lookup_worker(holding: Holding, queue: mp.Queue) -> None:
+    try:
+        queue.put(profile_for_holding(holding))
+    except Exception:
+        queue.put("")
+
+
+def profile_for_holding_with_timeout(holding: Holding, timeout: int = 12) -> str:
+    queue: mp.Queue = mp.Queue()
+    process = mp.Process(target=profile_lookup_worker, args=(holding, queue))
+    process.start()
+    process.join(timeout)
+    if process.is_alive():
+        process.terminate()
+        process.join(2)
+        return industry_fallback(holding) or "Industry unavailable"
+    if not queue.empty():
+        return queue.get() or industry_fallback(holding) or "Industry unavailable"
+    return industry_fallback(holding) or "Industry unavailable"
+
+
+def collect_displayed_holdings(results: list[dict]) -> list[Holding]:
+    displayed: dict[tuple[str, str, str], Holding] = {}
+    for result in results:
+        for bucket_name in ("new", "sold", "add", "reduce"):
+            for holding in result[bucket_name][:25]:
+                displayed.setdefault(holding.key, holding)
+    crowd: dict[str, Holding] = {}
+    counts: dict[str, int] = {}
+    for result in results:
+        for holding in result["new"]:
+            if holding.put_call:
+                continue
+            crowd.setdefault(holding.cusip, holding)
+            counts[holding.cusip] = counts.get(holding.cusip, 0) + 1
+    for cusip, count in counts.items():
+        if count >= 3:
+            holding = crowd[cusip]
+            displayed.setdefault(holding.key, holding)
+    return list(displayed.values())
+
+
+def build_profiles(holdings: list[Holding]) -> dict[tuple[str, str, str], str]:
+    profiles: dict[tuple[str, str, str], str] = {}
+    COMPANY_CACHE_DIR.mkdir(exist_ok=True)
+    cached_profiles = {}
+    if COMPANY_PROFILE_CACHE.exists():
+        cached_profiles = json.loads(COMPANY_PROFILE_CACHE.read_text(encoding="utf-8"))
+    total = len(holdings)
+    for index, holding in enumerate(holdings, 1):
+        cache_key = "|".join(holding.key)
+        if cache_key not in cached_profiles:
+            cached_profiles[cache_key] = profile_for_holding_with_timeout(holding)
+        profiles[holding.key] = cached_profiles[cache_key]
+        if index == 1 or index % 25 == 0 or index == total:
+            COMPANY_PROFILE_CACHE.write_text(
+                json.dumps(cached_profiles, ensure_ascii=False, indent=2, sort_keys=True),
+                encoding="utf-8",
+            )
+            print(f"Enriched company profiles: {index}/{total}", flush=True)
+    return profiles
+
+
+def security_cell(holding: Holding, profile: str = "") -> str:
     option = f" · {e(holding.put_call)} option" if holding.put_call else ""
     meta = f"{e(holding.title)}{option}"
+    profile_html = (
+        f'<div class="security-profile">{e(profile)}</div>'
+        if profile
+        else ""
+    )
     return (
         '<div class="security-name">'
         f'<div class="security-en">{e(holding.issuer)}</div>'
         f'<div class="security-meta">{meta}</div>'
+        f"{profile_html}"
         "</div>"
     )
 
 
-def holding_row(holding: Holding, value_label: str, share_or_change: str, cls: str = "") -> str:
+def holding_row(
+    holding: Holding,
+    value_label: str,
+    share_or_change: str,
+    cls: str = "",
+    profile: str = "",
+) -> str:
     change_class = f' class="{cls}"' if cls else ""
     return (
         "<tr>"
-        f"<td>{security_cell(holding)}</td>"
+        f"<td>{security_cell(holding, profile)}</td>"
         f'<td><span class="cusip">{e(holding.cusip)}</span></td>'
         f'<td class="num">{value_label}</td>'
         f'<td class="num"><span{change_class}>{share_or_change}</span></td>'
@@ -246,7 +556,7 @@ def bucket(title: str, cls: str, count: int, body: str) -> str:
     )
 
 
-def section_for_manager(result: dict) -> str:
+def section_for_manager(result: dict, profiles: dict[tuple[str, str, str], str]) -> str:
     current = result["current"]
     previous = result["previous"]
     latest = result["latest"]
@@ -260,10 +570,11 @@ def section_for_manager(result: dict) -> str:
     def rows_for(items: list[Holding], mode: str) -> list[str]:
         rows = []
         for holding in items:
+            profile = profiles.get(holding.key, "")
             if mode == "new":
-                rows.append(holding_row(holding, format_money(holding.value), format_int(holding.shares)))
+                rows.append(holding_row(holding, format_money(holding.value), format_int(holding.shares), profile=profile))
             elif mode == "sold":
-                rows.append(holding_row(holding, format_money(holding.value), format_int(holding.shares)))
+                rows.append(holding_row(holding, format_money(holding.value), format_int(holding.shares), profile=profile))
             elif mode == "add":
                 previous_holding = previous[holding.key]
                 change = pct_change(holding.shares, previous_holding.shares)
@@ -273,6 +584,7 @@ def section_for_manager(result: dict) -> str:
                         format_money(holding.value),
                         f"+{change}%",
                         "pct-up",
+                        profile,
                     )
                 )
             elif mode == "reduce":
@@ -284,6 +596,7 @@ def section_for_manager(result: dict) -> str:
                         format_money(holding.value),
                         f"{change}%",
                         "pct-down",
+                        profile,
                     )
                 )
         return rows
@@ -352,7 +665,7 @@ def build_report() -> list[dict]:
     return results
 
 
-def crowd_section(results: list[dict]) -> tuple[str, int]:
+def crowd_section(results: list[dict], profiles: dict[tuple[str, str, str], str]) -> tuple[str, int]:
     crowd: dict[str, dict] = {}
     for result in results:
         for holding in result["new"]:
@@ -372,7 +685,7 @@ def crowd_section(results: list[dict]) -> tuple[str, int]:
         holding = entry["holding"]
         rows.append(
             "<tr>"
-            f"<td>{security_cell(holding)}</td>"
+            f"<td>{security_cell(holding, profiles.get(holding.key, ''))}</td>"
             f'<td><span class="cusip">{e(holding.cusip)}</span></td>'
             f'<td class="num">{entry["count"]}</td>'
             f'<td class="num">{format_money(entry["value"])}</td>'
@@ -400,15 +713,16 @@ def crowd_section(results: list[dict]) -> tuple[str, int]:
 def render(results: list[dict]) -> str:
     generated = dt.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
     latest_period = max(result["latest"].report for result in results)
+    profiles = build_profiles(collect_displayed_holdings(results))
     significant_count = sum(
         len(result["new"]) + len(result["sold"]) + len(result["add"]) + len(result["reduce"])
         for result in results
     )
-    crowd_html, crowd_count = crowd_section(results)
+    crowd_html, crowd_count = crowd_section(results, profiles)
     nav_links = [
         f'<a href="#crowd">集中新建仓 <span class="pill">{crowd_count}</span></a>'
     ] + [f'<a href="#{result["slug"]}">{e(result["name"])}</a>' for result in results]
-    sections = crowd_html + "".join(section_for_manager(result) for result in results)
+    sections = crowd_html + "".join(section_for_manager(result, profiles) for result in results)
     style = """
 :root {
   --bg: #fafaf7;
@@ -506,6 +820,7 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; white-sp
 .security-name { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
 .security-en { font-weight: 500; }
 .security-meta { color: var(--muted); font-size: 12px; line-height: 1.35; }
+.security-profile { color: var(--amber); font-size: 12px; line-height: 1.35; }
 footer {
   margin-top: 32px; padding-top: 16px;
   color: var(--muted); font-size: 12px; text-align: center;
@@ -548,6 +863,7 @@ footer a { color: var(--muted); }
 {sections}
 <footer>
 数据来源 <a href="https://www.sec.gov/edgar/searchedgar/companysearch">SEC EDGAR</a> ·
+行业参考 Yahoo Finance search/profile ·
 13F 披露存在 45 天延迟 ·
 市值来自 13F information table 的 value 字段 ·
 仅用于信息整理，不构成投资建议
